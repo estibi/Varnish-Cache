@@ -43,6 +43,8 @@
 #include <unistd.h>
 #include <limits.h>
 
+#include <fcntl.h>
+
 #include "vqueue.h"
 
 #include "vsb.h"
@@ -50,6 +52,11 @@
 #include "libvarnish.h"
 #include "vsl.h"
 #include "varnishapi.h"
+
+#define	stats_file "/tmp/varnishtop_stats"
+#define	BUF_SIZE 1024
+#define	MAX_LINES 50
+
 
 #if 0
 #define AC(x) assert((x) != ERR)
@@ -150,14 +157,16 @@ accumulate(void *priv, enum VSL_tag_e tag, unsigned fd, unsigned len,
 }
 
 static void
-update(const struct VSM_data *vd, int period)
+update(const struct VSM_data *vd, int period, char *buf)
 {
 	struct top *tp, *tp2;
-	int l, len;
+	int l, len, fd;
 	double t = 0;
 	static time_t last = 0;
 	static unsigned n;
 	time_t now;
+
+    mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
 
 	now = time(NULL);
 	if (now == last)
@@ -167,18 +176,31 @@ update(const struct VSM_data *vd, int period)
 	l = 1;
 	if (n < period)
 		n++;
-	AC(erase());
-	AC(mvprintw(0, 0, "%*s", COLS - 1, VSM_Name(vd)));
-	AC(mvprintw(0, 0, "list length %u", ntop));
+
+	fd = open(stats_file, O_WRONLY | O_CREAT | O_TRUNC, mode);
+	if (fd == NULL) {
+		printf("CANT OPEN STAT FILE\n");
+		return;
+	}
+
+	printf("list length %u\n", ntop);
 	VTAILQ_FOREACH_SAFE(tp, &top_head, list, tp2) {
-		if (++l < LINES) {
+		if (++l < MAX_LINES) {
 			len = tp->clen;
 			if (len > COLS - 20)
 				len = COLS - 20;
-			AC(mvprintw(l, 0, "%9.2f %-*.*s %*.*s\n",
-			    tp->count, maxfieldlen, maxfieldlen,
-			    VSL_tags[tp->tag],
-			    len, len, tp->rec_data));
+			snprintf(buf,
+				BUF_SIZE,
+				"%9.2f %-*.*s %*.*s\n",
+				tp->count,
+				maxfieldlen,
+				maxfieldlen,
+				VSL_tags[tp->tag],
+				len,
+				len,
+				tp->rec_data);
+			printf(buf);
+			write(fd, buf, strnlen(buf, BUF_SIZE));
 			t = tp->count;
 		}
 		tp->count += (1.0/3.0 - tp->count) / (double)n;
@@ -189,7 +211,7 @@ update(const struct VSM_data *vd, int period)
 			ntop--;
 		}
 	}
-	AC(refresh());
+	close(fd);
 }
 
 static void *
@@ -215,6 +237,8 @@ do_curses(struct VSM_data *vd, int period)
 	pthread_t thr;
 	int i;
 
+	char buf[BUF_SIZE];
+
 	for (i = 0; i < 256; i++) {
 		if (VSL_tags[i] == NULL)
 			continue;
@@ -227,19 +251,12 @@ do_curses(struct VSM_data *vd, int period)
 		exit(1);
 	}
 
-	(void)initscr();
-	AC(raw());
-	AC(noecho());
-	AC(nonl());
-	AC(intrflush(stdscr, FALSE));
-	(void)curs_set(0);
-	AC(erase());
 	for (;;) {
 		AZ(pthread_mutex_lock(&mtx));
-		update(vd, period);
+		update(vd, period, &buf);
 		AZ(pthread_mutex_unlock(&mtx));
 
-		timeout(1000);
+		usleep(1);
 		switch (getch()) {
 		case ERR:
 			break;
@@ -250,23 +267,18 @@ do_curses(struct VSM_data *vd, int period)
 #endif
 		case '\014': /* Ctrl-L */
 		case '\024': /* Ctrl-T */
-			AC(redrawwin(stdscr));
-			AC(refresh());
 			break;
 		case '\003': /* Ctrl-C */
 			AZ(raise(SIGINT));
 			break;
 		case '\032': /* Ctrl-Z */
-			AC(endwin());
 			AZ(raise(SIGTSTP));
 			break;
 		case '\021': /* Ctrl-Q */
 		case 'Q':
 		case 'q':
-			AC(endwin());
 			return;
 		default:
-			AC(beep());
 			break;
 		}
 	}
