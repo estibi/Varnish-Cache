@@ -213,6 +213,8 @@ are available:
 Backends can be used with *directors*. Please see the
 vmod_directors(3) man page for more information.
 
+.. _reference-vcl_probes:
+
 Probes
 ------
 
@@ -369,7 +371,8 @@ return()
   in the request handling state machine.
 
 rollback()
-  Restore request HTTP headers to their original state.
+  Restore *req* HTTP headers to their original state. This function is
+  deprecated.  Use std.rollback() instead.
 
 synthetic(STRING)
   Prepare a synthetic response body containing the STRING. Available in

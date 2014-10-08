@@ -137,11 +137,22 @@ cnt_deliver(struct worker *wrk, struct req *req)
 	if (req->restarts >= cache_param->max_restarts)
 		wrk->handling = VCL_RET_DELIVER;
 
-	if (wrk->handling == VCL_RET_RESTART) {
+	if (wrk->handling != VCL_RET_DELIVER) {
 		(void)HSH_DerefObj(&wrk->stats, &req->obj);
 		AZ(req->obj);
 		http_Teardown(req->resp);
-		req->req_step = R_STP_RESTART;
+
+		switch (wrk->handling) {
+		case VCL_RET_RESTART:
+			req->req_step = R_STP_RESTART;
+			break;
+		case VCL_RET_SYNTH:
+			req->req_step = R_STP_SYNTH;
+			break;
+		default:
+			INCOMPL();
+		}
+
 		return (REQ_FSM_MORE);
 	}
 
@@ -461,8 +472,7 @@ cnt_lookup(struct worker *wrk, struct req *req)
 
 	if (boc != NULL) {
 		(void)HSH_DerefObjCore(&wrk->stats, &boc);
-		free(req->vary_b);
-		req->vary_b = NULL;
+		VRY_Clear(req);
 	}
 
 	return (REQ_FSM_MORE);
@@ -516,7 +526,7 @@ cnt_miss(struct worker *wrk, struct req *req)
 	default:
 		WRONG("Illegal return from vcl_miss{}");
 	}
-	free(req->vary_b);
+	VRY_Clear(req);
 	if (o != NULL)
 		(void)HSH_DerefObj(&wrk->stats, &o);
 	AZ(HSH_DerefObjCore(&wrk->stats, &req->objcore));
@@ -708,6 +718,21 @@ cnt_recv(struct worker *wrk, struct req *req)
 
 	http_VSL_log(req->http);
 
+	if (req->restarts == 0) {
+		/*
+		 * This really should be done earlier, but we want to capture
+		 * it in the VSL log.
+		 */
+		if (http_GetHdr(req->http, H_X_Forwarded_For, &xff)) {
+			http_Unset(req->http, H_X_Forwarded_For);
+			http_PrintfHeader(req->http, "X-Forwarded-For: %s, %s",
+			    xff, req->sp->client_addr_str);
+		} else {
+			http_PrintfHeader(req->http, "X-Forwarded-For: %s",
+			    req->sp->client_addr_str);
+		}
+	}
+
 	if (req->err_code) {
 		req->req_step = R_STP_SYNTH;
 		return (REQ_FSM_MORE);
@@ -723,25 +748,15 @@ cnt_recv(struct worker *wrk, struct req *req)
 	req->hash_always_miss = 0;
 	req->hash_ignore_busy = 0;
 	req->client_identity = NULL;
-	if (req->restarts == 0) {
-		if (http_GetHdr(req->http, H_X_Forwarded_For, &xff)) {
-			http_Unset(req->http, H_X_Forwarded_For);
-			http_PrintfHeader(req->http, "X-Forwarded-For: %s, %s", xff,
-					  req->sp->client_addr_str);
-		} else {
-			http_PrintfHeader(req->http, "X-Forwarded-For: %s",
-					  req->sp->client_addr_str);
-		}
-	}
 
 	http_CollectHdr(req->http, H_Cache_Control);
 
 	VCL_recv_method(req->vcl, wrk, req, NULL, req->http->ws);
 
 	/* Attempts to cache req.body may fail */
-	if (req->req_body_status == REQ_BODY_FAIL) {
+	if (req->req_body_status == REQ_BODY_FAIL)
 		return (REQ_FSM_DONE);
-	}
+
 	recv_handling = wrk->handling;
 
 	/* We wash the A-E header here for the sake of VRY */
@@ -945,7 +960,7 @@ CNT_AcctLogCharge(struct dstat *ds, struct req *req)
 
 	a = &req->acct;
 
-	if (!(req->res_mode & RES_PIPE)) {
+	if (req->vsl->wid && !(req->res_mode & RES_PIPE)) {
 		VSLb(req->vsl, SLT_ReqAcct, "%ju %ju %ju %ju %ju %ju",
 		    (uintmax_t)a->req_hdrbytes,
 		    (uintmax_t)a->req_bodybytes,
